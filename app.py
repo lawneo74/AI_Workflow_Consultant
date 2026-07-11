@@ -10,6 +10,7 @@ The app never executes the generated prompts — it is strictly a
 copy-paste generator.
 """
 
+import hmac
 import json
 import os
 
@@ -133,6 +134,49 @@ GENERATOR_SCHEMA = {
 }
 
 
+def get_passcodes() -> list[str]:
+    """Return the two configured login passcodes.
+
+    Read from the APP_PASSCODES env var or Streamlit secrets as a
+    comma-separated pair, e.g. APP_PASSCODES="alpha-1234,bravo-5678".
+    """
+    raw = os.environ.get("APP_PASSCODES")
+    if not raw:
+        try:
+            raw = st.secrets.get("APP_PASSCODES", None)
+        except Exception:
+            raw = None
+    if not raw:
+        return []
+    return [p.strip() for p in str(raw).split(",") if p.strip()][:2]
+
+
+def check_login() -> bool:
+    """Render the login page until a valid passcode is entered."""
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.title("🧭 AI Workflow Architect")
+    st.subheader("Sign in")
+
+    passcodes = get_passcodes()
+    if not passcodes:
+        st.warning("No passcodes configured. Set `APP_PASSCODES` to enable login.")
+        return False
+
+    with st.form("login_form"):
+        entered = st.text_input("Passcode", type="password")
+        submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+
+    if submitted:
+        if any(hmac.compare_digest(entered, code) for code in passcodes):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect passcode.")
+    return False
+
+
 def get_client() -> anthropic.Anthropic | None:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -223,6 +267,15 @@ def render_workflow(workflow: dict) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="AI Workflow Architect", page_icon="🧭", layout="centered")
+
+    if not check_login():
+        return
+
+    with st.sidebar:
+        if st.button("Sign out", use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
+
     st.title("🧭 AI Workflow Architect")
     st.caption(
         "Describe your goal and get a chained, copy-paste workflow routed to the "

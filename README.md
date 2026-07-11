@@ -22,6 +22,17 @@ generator.
 
 ```bash
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-ant-...   # or enter it in the app sidebar
+export ANTHROPIC_API_KEY=sk-ant-...        # or enter it in the app
+export APP_PASSCODES="code-one,code-two"   # the two login passcodes
 streamlit run app.py
 ```
+
+Both values can also be set in `.streamlit/secrets.toml` instead of the
+environment:
+
+```toml
+ANTHROPIC_API_KEY = "sk-ant-..."
+APP_PASSCODES = "code-one,code-two"
+```
+
+The app shows a login page first; either of the two passcodes signs you in.

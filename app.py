@@ -296,7 +296,16 @@ def main() -> None:
         "Describe your task or goal.",
         height=140,
         placeholder="e.g. Research AI agent frameworks in 2026 and write a whitepaper.",
+        key="task_input",
     )
+
+    # Editing the input invalidates the previous result: clear it from memory
+    # so a stale workflow is never shown alongside a different task.
+    if "workflow" in st.session_state and task.strip() != st.session_state.get(
+        "workflow_task"
+    ):
+        del st.session_state["workflow"]
+        st.session_state.pop("workflow_task", None)
 
     if st.button("Architect My Workflow", type="primary", use_container_width=True):
         if client is None:
@@ -330,6 +339,7 @@ def main() -> None:
             st.stop()
 
         st.session_state["workflow"] = workflow
+        st.session_state["workflow_task"] = task.strip()
 
     if "workflow" in st.session_state:
         st.divider()

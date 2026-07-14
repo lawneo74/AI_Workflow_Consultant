@@ -25,6 +25,15 @@ The generator payload: `strategy_summary`, `recommended_environments`,
 `app` (one of the three environments), `model`, `transition` (empty string
 when the app doesn't change), and `prompt` (the copy-paste text).
 
+## Result invalidation
+
+A generated workflow is cached in `st.session_state["workflow"]`, keyed by
+the task that produced it in `st.session_state["workflow_task"]`. On every
+rerun, if the (stripped) task input no longer matches `workflow_task`, the
+stale workflow is deleted from session state so it is never shown next to a
+different task — the user re-runs the button to regenerate. The comparison
+is whitespace-tolerant (`.strip()`).
+
 ## Hard PRD constraints — do not violate
 
 - The app must NOT execute generated prompts via APIs. Strictly a

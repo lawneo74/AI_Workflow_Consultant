@@ -1,29 +1,44 @@
 # AI Workflow Architect
 
 Streamlit app (`app.py`, single file) that turns a raw task description into a
-chained, copy-paste workflow routed to the best execution environment(s):
-Claude Desktop, Claude Code, or Perplexity Native. Built from the PRD
-"AI Workflow Architect".
+chained, copy-paste workflow routed to the best of the AI tools the user
+actually has. Built from the PRD "AI Workflow Architect".
+
+The user selects, via a multiselect (minimum one), which tools they have from
+`TOOL_CATALOG`: Perplexity AI, Claude, ChatGPT, NotebookLM, Gemini (incl. Nano
+Banana). Workflows are routed **only** to the selected tools — the JSON-schema
+`app`/`recommended_environments` enums are built dynamically from that
+selection (`build_generator_schema` / `build_review_schema`).
 
 ## Architecture
 
-Two-tier Anthropic backend (see `app.py`):
-
-1. **Router** — `claude-haiku-4-5` classifies the task as `simple` or
-   `complex` (`route_task`).
-2. **Generator** — simple tasks stay on Haiku; complex/multi-step/coding
-   tasks go to `claude-sonnet-5` (`generate_workflow`).
-
-Both calls use structured outputs (`output_config.format` with a
-`json_schema`) so responses are guaranteed-valid JSON — parse the first
-`text` block with `json.loads`, never regex. Schemas live in
-`ROUTER_SCHEMA` / `GENERATOR_SCHEMA`; every object needs
+Three-tier Anthropic backend (see `app.py`), all using structured outputs
+(`output_config.format` with a `json_schema`) — parse the first `text` block
+with `json.loads`, never regex. Every schema object needs
 `additionalProperties: false` and a full `required` list.
 
-The generator payload: `strategy_summary`, `recommended_environments`,
-`effort_level` (Low/Medium/High), and `steps[]` where each step has `title`,
-`app` (one of the three environments), `model`, `transition` (empty string
-when the app doesn't change), and `prompt` (the copy-paste text).
+1. **Router** — `claude-haiku-4-5` classifies the task `simple`/`complex`
+   (`route_task`, `ROUTER_SCHEMA`).
+2. **Generator** — simple → Haiku, complex → `claude-sonnet-5`
+   (`generate_workflow`). System prompt is built per-request by
+   `build_generator_system(selected_tools)` and bakes in
+   `PROMPT_ENGINEERING_PRINCIPLES`.
+3. **Reviewer** — `claude-sonnet-5` does a mandatory final quality pass
+   (`review_workflow`) that refines prompts/routing and adds `review_summary`.
+
+Workflow payload: `strategy_summary`, `recommended_environments`,
+`effort_level` (Low/Medium/High), `steps[]` (each: `title`, `app` — one of the
+selected tools, `model` — recommended mode/model or `""`, `transition` — empty
+when the app doesn't change, `prompt`), plus `review_summary` (reviewer only).
+
+## Exports & session
+
+- Downloads: `build_markdown` / `build_docx` (python-docx) / `build_pdf`
+  (reportlab, pure-Python — no system deps). All escape user text and wrap long
+  lines; verified against Unicode, smart quotes, and `<`/`&`. Download buttons
+  are guarded with `ModuleNotFoundError` fallbacks.
+- "Start new session" (`start_new_session`) clears `workflow` / `workflow_task` /
+  `task_input` but keeps auth and the API key; "Sign out" clears everything.
 
 ## Result invalidation
 

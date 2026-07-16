@@ -1,18 +1,26 @@
 # AI Workflow Architect
 
 Streamlit app (`app.py`, single file) that turns a raw task description into a
-chained, copy-paste workflow routed to the best execution environment(s):
-Claude Desktop, Claude Code, or Perplexity Native. Built from the PRD
-"AI Workflow Architect".
+chained, copy-paste workflow routed to the best of the AI tools the user
+actually has. Built from the PRD "AI Workflow Architect".
+
+The user selects, via a multiselect (minimum one), which tools they have from
+`TOOL_CATALOG`: Perplexity AI, Claude, ChatGPT, NotebookLM, Gemini (incl. Nano
+Banana). Workflows are routed **only** to the selected tools — the JSON-schema
+`app`/`recommended_environments` enums are built dynamically from that
+selection (`build_generator_schema` / `build_review_schema`).
 
 ## Architecture
 
-Pipeline in `app.py`: router → optional research → generator → alignment
-review (with one automatic revision).
+Pipeline in `app.py`: router → optional research → generator → final review.
+All Anthropic calls use structured outputs (`output_config.format` with a
+`json_schema`) — parse the first `text` block with `json.loads`, never regex.
+Every schema object needs `additionalProperties: false` and a full `required`
+list.
 
-1. **Router** — `claude-haiku-4-5` classifies the task as `simple` or
-   `complex`, and sets `needs_research` + `research_query` when live facts
-   would improve the plan (`route_task`).
+1. **Router** — `claude-haiku-4-5` classifies the task `simple`/`complex`
+   and sets `needs_research` + `research_query` when live facts would improve
+   the plan (`route_task`, `ROUTER_SCHEMA`).
 2. **Research (optional)** — `run_research` calls the Perplexity chat
    completions API (`sonar-pro`, plain `requests`, 45s timeout) with the
    router's query. Best-effort: any failure returns `None` and planning
@@ -20,30 +28,41 @@ review (with one automatic revision).
    in-app expander shown only when unconfigured). This is pre-generation
    context gathering — it does NOT execute generated prompts, so it doesn't
    violate the no-execution constraint below.
-3. **Generator** — simple tasks stay on Haiku; complex/multi-step/coding
-   tasks go to `claude-sonnet-5` (`generate_workflow`). Research findings,
-   when present, are appended to the user message. The same function also
-   handles revisions (pass `prior_workflow` + `feedback`).
-4. **Alignment review** — `review_workflow` (same model as the generator)
-   returns `{aligned, feedback}`. If misaligned, `main` regenerates once
-   with the feedback, re-reviews, and surfaces the final verdict as a
-   caption note above the rendered workflow (stored in
-   `st.session_state["workflow_notes"]`).
+3. **Generator** — simple → Haiku, complex → `claude-sonnet-5`
+   (`generate_workflow`). System prompt is built per-request by
+   `build_generator_system(selected_tools)` and bakes in
+   `PROMPT_ENGINEERING_PRINCIPLES` + `CLAUDE_STEP_RULE`. Research findings,
+   when present, are appended to the user message.
+4. **Reviewer** — `claude-sonnet-5` does a mandatory final quality pass
+   (`review_workflow`): goal alignment is the first and most important check
+   (the plan must fully deliver the user's stated goal), then tool routing,
+   Claude model/effort presence, prompt quality, transitions, and coherence.
+   It returns the improved plan plus a `review_summary` that states the
+   alignment verdict; research findings are passed through for consistency
+   checking. Research/availability status notes are stored in
+   `st.session_state["workflow_notes"]` and rendered as captions above the
+   plan.
 
-All Anthropic calls use structured outputs (`output_config.format` with a
-`json_schema`) so responses are guaranteed-valid JSON — parse the first
-`text` block with `json.loads`, never regex. Schemas live in
-`ROUTER_SCHEMA` / `GENERATOR_SCHEMA` / `REVIEW_SCHEMA`; every object needs
-`additionalProperties: false` and a full `required` list.
+Workflow payload: `strategy_summary`, `recommended_environments`,
+`effort_level` (Low/Medium/High), `steps[]` (each: `title`, `app` — one of the
+selected tools, `model` — recommended mode/model or `""`, `effort` —
+Low/Medium/High for Claude steps (the Claude Code `/effort` setting or
+Extended Thinking in the Claude app; empty string for other tools),
+`transition` — empty when the app doesn't change, `prompt`), plus
+`review_summary` (reviewer only). Steps routed to "Claude" must always carry
+both a model and an effort recommendation (`CLAUDE_STEP_RULE`, enforced by
+generator and reviewer); `render_workflow` and the exports show model/effort
+only when non-empty (`step_meta_text`).
 
-The generator payload: `strategy_summary`, `recommended_environments`,
-`effort_level` (Low/Medium/High), and `steps[]` where each step has `title`,
-`app` (one of the three environments), `model`, `effort` (Low/Medium/High
-for Claude steps — the Claude Code `/effort` setting or Extended Thinking in
-Claude Desktop; empty string for Perplexity steps), `transition` (empty
-string when the app doesn't change), and `prompt` (the copy-paste text).
-Claude steps must always carry both a model and an effort recommendation;
-`render_workflow` shows effort only when non-empty.
+## Exports & session
+
+- Downloads: `build_markdown` / `build_docx` (python-docx) / `build_pdf`
+  (reportlab, pure-Python — no system deps). All escape user text and wrap long
+  lines; verified against Unicode, smart quotes, and `<`/`&`. Download buttons
+  are guarded with `ModuleNotFoundError` fallbacks.
+- "Start new session" (`start_new_session`) clears `workflow` / `workflow_task` /
+  `workflow_notes` / `task_input` but keeps auth and the API key; "Sign out"
+  clears everything.
 
 ## Result invalidation
 

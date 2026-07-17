@@ -902,10 +902,6 @@ def main() -> None:
                     client, task.strip(), route["complexity"], selected_tools,
                     research=research,
                 )
-            with st.spinner("Running the final alignment review…"):
-                workflow = review_workflow(
-                    client, task.strip(), selected_tools, draft, research=research
-                )
         except anthropic.AuthenticationError:
             st.error("Invalid Anthropic API key.")
             st.stop()
@@ -921,6 +917,26 @@ def main() -> None:
         except (json.JSONDecodeError, StopIteration, KeyError):
             st.error("The planner returned an unexpected response. Please try again.")
             st.stop()
+
+        # The final review is a best-effort quality pass — if it can't complete
+        # (rate limit, API error, malformed response), fall back to the
+        # unreviewed draft rather than failing the whole run.
+        try:
+            with st.spinner("Running the final alignment review…"):
+                workflow = review_workflow(
+                    client, task.strip(), selected_tools, draft, research=research
+                )
+        except (
+            anthropic.APIError,
+            json.JSONDecodeError,
+            StopIteration,
+            KeyError,
+        ):
+            workflow = draft
+            notes.append(
+                "⚠️ The final review step didn't complete — showing the "
+                "unreviewed draft plan."
+            )
 
         st.session_state["workflow"] = workflow
         st.session_state["workflow_task"] = task.strip()

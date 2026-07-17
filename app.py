@@ -5,18 +5,25 @@ workflow. The user picks which AI tools they actually have access to
 (Perplexity AI, Claude, ChatGPT, NotebookLM, Gemini incl. Nano Banana), and a
 three-tier Anthropic backend does the rest:
 
-1. Router  — Haiku classifies the task's complexity.
-2. Generator — Haiku (simple) or Sonnet (complex) designs the workflow,
+1. Router  — Haiku classifies the task's complexity and flags whether live
+   web research would improve the plan.
+2. Research (optional) — when the router asks for it and a Perplexity API key
+   is configured, one sonar-pro search grounds the plan in current facts.
+3. Generator — Haiku (simple) or Sonnet (complex) designs the workflow,
    applying professional prompt-engineering principles to every step.
-3. Reviewer — Sonnet does a final quality pass, refining the prompts and the
-   tool routing before anything is shown to the user.
+4. Reviewer — Sonnet does a final quality pass that checks the plan is
+   aligned with the user's goal and refines the prompts and tool routing
+   before anything is shown to the user.
 
-Each step is labeled with the exact app to paste it into; when a workflow
-spans multiple apps a Transition note explains how to carry the data across.
-The finished plan can be downloaded as Markdown, Word (.docx), or PDF.
+Each step is labeled with the exact app to paste it into; steps routed to
+Claude also carry a recommended Claude model and effort level. When a
+workflow spans multiple apps a Transition note explains how to carry the
+data across. The finished plan can be downloaded as Markdown, Word (.docx),
+or PDF.
 
 The app never executes the generated prompts — it is strictly a copy-paste
-generator.
+generator. (The optional Perplexity call gathers planning context before
+generation; it never runs the generated prompts.)
 """
 
 import hmac
@@ -25,12 +32,15 @@ import json
 import os
 
 import anthropic
+import requests
 import streamlit as st
 
 ROUTER_MODEL = "claude-haiku-4-5"
 SIMPLE_GENERATOR_MODEL = "claude-haiku-4-5"
 COMPLEX_GENERATOR_MODEL = "claude-sonnet-5"
 REVIEW_MODEL = "claude-sonnet-5"
+PERPLEXITY_RESEARCH_MODEL = "sonar-pro"
+PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
 
 # The catalog of tools the user may have. Each carries a routing description
 # (fed to the model) and a badge color (for the UI / step labels).
@@ -88,6 +98,13 @@ software engineering or coding, research combined with synthesis, work that
 spans more than one tool, or open-ended deliverables (reports, whitepapers,
 applications). Classify as "simple" for single-shot tasks: a lookup, a quick
 rewrite, a summary of provided text, a single well-scoped prompt.
+
+Also decide whether a live web search would materially improve the workflow
+plan — set "needs_research" true when the task depends on current facts,
+recent tools/versions, market conditions, or anything likely to have changed
+since your training data. When true, write a focused "research_query" (one
+search query capturing what the planner needs to know). When false, use an
+empty string for "research_query".
 """
 
 ROUTER_SCHEMA = {
@@ -98,8 +115,16 @@ ROUTER_SCHEMA = {
             "type": "string",
             "description": "One-sentence justification for the classification.",
         },
+        "needs_research": {
+            "type": "boolean",
+            "description": "True when live web research would improve the plan.",
+        },
+        "research_query": {
+            "type": "string",
+            "description": "Search query for the research step; empty if not needed.",
+        },
     },
-    "required": ["complexity", "reasoning"],
+    "required": ["complexity", "reasoning", "needs_research", "research_query"],
     "additionalProperties": False,
 }
 
@@ -124,6 +149,18 @@ can paste verbatim. Apply these prompt-engineering principles to each one:
 - Tone & audience: specify the intended audience and register when relevant.
 Keep prompts specific and self-contained — never write a vague one-liner."""
 
+# Rule applied by both the generator and the reviewer: Claude steps must carry
+# a concrete model + effort recommendation.
+CLAUDE_STEP_RULE = """\
+- For every step routed to "Claude" you MUST recommend both the Claude model
+  to use (in "model", e.g. claude-sonnet-5 for most work, claude-fable-5 or
+  claude-opus-4-8 for the hardest reasoning) AND the "effort" to use ("Low",
+  "Medium", or "High"). Effort is the reasoning depth the user should set:
+  the /effort setting in Claude Code, or Extended Thinking in the Claude app
+  when "High". Reserve "High" for the hardest reasoning, design, or debugging
+  steps. For steps in other tools, "effort" must be an empty string (use
+  "model" for a mode/model suggestion only when clearly useful)."""
+
 
 def _tool_menu(selected_tools: list[str]) -> str:
     """Render the description block for the tools the user selected."""
@@ -146,12 +183,16 @@ Rules:
   only when different phases clearly belong in different tools.
 - Every step must name the exact app to paste the prompt into (from the list
   above) and provide a complete, copy-paste-ready prompt for that app.
+{CLAUDE_STEP_RULE}
 - When a step runs in a different app than the previous step, fill
   "transition" with a brief, practical note on how to carry the earlier
   output across (e.g. how to export, copy, or re-attach it). Use an empty
   string for the first step or when the app does not change.
 - "effort_level" reflects the user's expected hands-on effort: "Low",
   "Medium", or "High".
+- If research findings are provided with the task, treat them as current,
+  authoritative context: ground the strategy and step prompts in them
+  (correct tool names, versions, and facts) instead of stale knowledge.
 - Do not include tool setup instructions or usage-limit caveats anywhere.
 
 {PROMPT_ENGINEERING_PRINCIPLES}"""
@@ -166,17 +207,28 @@ ONLY these tools — every step must stay within this list:
 
 Critically review the draft workflow and return an improved final version.
 Check and fix:
+- Goal alignment (most important): executing the workflow step by step must
+  fully deliver the user's stated goal — nothing missing, no scope drift, no
+  steps the user did not ask for, and the final step produces the intended
+  deliverable. Rework the plan if it falls short.
 - Tool routing: every step uses an allowed tool and the best-fit tool for its
   phase; the chain uses the fewest tools that genuinely fit.
+- Claude recommendations: every step routed to "Claude" carries a concrete
+  Claude model in "model" and an "effort" of "Low", "Medium", or "High" (the
+  /effort setting in Claude Code, or Extended Thinking in the Claude app when
+  "High"); steps in other tools keep "effort" as an empty string.
 - Prompt quality: each prompt applies professional prompt-engineering
   principles — clear role/context, explicit task, structured output spec,
   constraints, success criteria, and references to prior steps' outputs.
 - Transitions: present and accurate wherever the app changes; empty otherwise.
 - Coherence: steps flow logically and together fully accomplish the task.
+- If research findings accompany the task, the plan must be consistent with
+  them (current tool names, versions, and facts).
 
 Rewrite and tighten prompts as needed. Then write a short "review_summary"
-(2-3 sentences) describing what you verified or improved. Do not include tool
-setup instructions or usage-limit caveats anywhere.
+(2-3 sentences) that states explicitly whether the final plan is aligned with
+the user's goal and what you verified or improved. Do not include tool setup
+instructions or usage-limit caveats anywhere.
 
 {principles}"""
 
@@ -203,8 +255,18 @@ def _workflow_properties(selected_tools: list[str]) -> dict:
                     "model": {
                         "type": "string",
                         "description": (
-                            "Recommended mode or model within the app, or an "
-                            "empty string if not applicable."
+                            "Recommended mode or model within the app. Required "
+                            "for Claude steps (a Claude model id); empty string "
+                            "if not applicable."
+                        ),
+                    },
+                    "effort": {
+                        "type": "string",
+                        "enum": ["Low", "Medium", "High", ""],
+                        "description": (
+                            "Reasoning effort for Claude steps (the /effort "
+                            "setting in Claude Code; High = Extended Thinking "
+                            "in the Claude app). Empty string for other tools."
                         ),
                     },
                     "transition": {
@@ -219,7 +281,7 @@ def _workflow_properties(selected_tools: list[str]) -> dict:
                         "description": "The copy-paste prompt for this step.",
                     },
                 },
-                "required": ["title", "app", "model", "transition", "prompt"],
+                "required": ["title", "app", "model", "effort", "transition", "prompt"],
                 "additionalProperties": False,
             },
         },
@@ -244,7 +306,10 @@ def build_review_schema(selected_tools: list[str]) -> dict:
     props = _workflow_properties(selected_tools)
     props["review_summary"] = {
         "type": "string",
-        "description": "2-3 sentences on what was verified or improved.",
+        "description": (
+            "2-3 sentences stating whether the plan is aligned with the goal "
+            "and what was verified or improved."
+        ),
     }
     return {
         "type": "object",
@@ -317,13 +382,64 @@ def get_client() -> anthropic.Anthropic | None:
     return anthropic.Anthropic(api_key=api_key)
 
 
+def get_perplexity_key() -> str | None:
+    api_key = os.environ.get("PERPLEXITY_API_KEY")
+    if not api_key:
+        try:
+            api_key = st.secrets.get("PERPLEXITY_API_KEY", None)
+        except Exception:
+            api_key = None
+    if not api_key:
+        api_key = st.session_state.get("perplexity_key_input") or None
+    return api_key
+
+
+def run_research(api_key: str, query: str) -> str | None:
+    """Run one Perplexity search to gather live context for the planner.
+
+    Returns the research findings (with source URLs when available), or None
+    if the search fails — research is best-effort and never blocks planning.
+    """
+    try:
+        response = requests.post(
+            PERPLEXITY_API_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": PERPLEXITY_RESEARCH_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a research assistant. Answer concisely "
+                            "with current, factual information the requester "
+                            "can plan against. Include key names, versions, "
+                            "and dates."
+                        ),
+                    },
+                    {"role": "user", "content": query},
+                ],
+            },
+            timeout=45,
+        )
+        response.raise_for_status()
+        data = response.json()
+        findings = data["choices"][0]["message"]["content"]
+        sources = data.get("citations") or data.get("search_results") or []
+        urls = [s["url"] if isinstance(s, dict) else s for s in sources][:5]
+        if urls:
+            findings += "\n\nSources:\n" + "\n".join(f"- {u}" for u in urls)
+        return findings
+    except (requests.RequestException, KeyError, IndexError, ValueError):
+        return None
+
+
 def extract_json(response) -> dict:
     text = next(b.text for b in response.content if b.type == "text")
     return json.loads(text)
 
 
 def route_task(client: anthropic.Anthropic, task: str) -> dict:
-    """Layer 1 — Haiku classifies task complexity."""
+    """Layer 1 — Haiku classifies task complexity and the need for research."""
     response = client.messages.create(
         model=ROUTER_MODEL,
         max_tokens=300,
@@ -335,12 +451,22 @@ def route_task(client: anthropic.Anthropic, task: str) -> dict:
 
 
 def generate_workflow(
-    client: anthropic.Anthropic, task: str, complexity: str, selected_tools: list[str]
+    client: anthropic.Anthropic,
+    task: str,
+    complexity: str,
+    selected_tools: list[str],
+    research: str | None = None,
 ) -> tuple[dict, str]:
     """Layer 2 — Haiku (simple) or Sonnet (complex) drafts the workflow."""
     model = (
         COMPLEX_GENERATOR_MODEL if complexity == "complex" else SIMPLE_GENERATOR_MODEL
     )
+    content = (
+        f"Available tools: {', '.join(selected_tools)}\n\n"
+        f"Design the workflow for this task:\n\n{task}"
+    )
+    if research:
+        content += f"\n\n---\n\nResearch findings (from a live web search):\n\n{research}"
     response = client.messages.create(
         model=model,
         max_tokens=8000,
@@ -348,27 +474,30 @@ def generate_workflow(
         output_config={
             "format": {"type": "json_schema", "schema": build_generator_schema(selected_tools)}
         },
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"Available tools: {', '.join(selected_tools)}\n\n"
-                    f"Design the workflow for this task:\n\n{task}"
-                ),
-            }
-        ],
+        messages=[{"role": "user", "content": content}],
     )
     return extract_json(response), model
 
 
 def review_workflow(
-    client: anthropic.Anthropic, task: str, selected_tools: list[str], draft: dict
+    client: anthropic.Anthropic,
+    task: str,
+    selected_tools: list[str],
+    draft: dict,
+    research: str | None = None,
 ) -> dict:
-    """Layer 3 — Sonnet does the final review pass and returns the polished plan."""
+    """Layer 3 — Sonnet reviews goal alignment and returns the polished plan."""
     system = REVIEW_SYSTEM_TEMPLATE.format(
         menu=_tool_menu(selected_tools),
         principles=PROMPT_ENGINEERING_PRINCIPLES,
     )
+    content = (
+        f"Available tools: {', '.join(selected_tools)}\n\n"
+        f"Original task:\n{task}\n\n"
+        f"Draft workflow to review (JSON):\n{json.dumps(draft, indent=2)}"
+    )
+    if research:
+        content += f"\n\n---\n\nResearch findings (from a live web search):\n\n{research}"
     response = client.messages.create(
         model=REVIEW_MODEL,
         max_tokens=8000,
@@ -376,16 +505,7 @@ def review_workflow(
         output_config={
             "format": {"type": "json_schema", "schema": build_review_schema(selected_tools)}
         },
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"Available tools: {', '.join(selected_tools)}\n\n"
-                    f"Original task:\n{task}\n\n"
-                    f"Draft workflow to review (JSON):\n{json.dumps(draft, indent=2)}"
-                ),
-            }
-        ],
+        messages=[{"role": "user", "content": content}],
     )
     return extract_json(response)
 
@@ -397,6 +517,16 @@ def app_badge(app_name: str) -> str:
         f'border-radius:12px; font-size:0.85em; font-weight:600; '
         f'white-space:nowrap;">{app_name}</span>'
     )
+
+
+def step_meta_text(step: dict) -> str:
+    """Model/effort metadata suffix for a step, shared by UI and exports."""
+    meta = ""
+    if step.get("model", "").strip():
+        meta += f"Suggested model/mode: {step['model']}"
+    if step.get("effort", "").strip():
+        meta += ("  ·  " if meta else "") + f"Effort: {step['effort']}"
+    return meta
 
 
 # --------------------------------------------------------------------------- #
@@ -428,6 +558,8 @@ def build_markdown(task: str, workflow: dict) -> str:
         meta = f"**Paste into:** {step['app']}"
         if step.get("model", "").strip():
             meta += f"  ·  **Suggested model/mode:** {step['model']}"
+        if step.get("effort", "").strip():
+            meta += f"  ·  **Effort:** {step['effort']}"
         lines.append(meta)
         lines.append("")
         lines.append("```text")
@@ -471,9 +603,9 @@ def build_docx(task: str, workflow: dict) -> bytes:
         meta = doc.add_paragraph()
         meta.add_run("Paste into: ").bold = True
         meta.add_run(step["app"])
-        if step.get("model", "").strip():
-            meta.add_run("   ·   Suggested model/mode: ").bold = True
-            meta.add_run(step["model"])
+        if step_meta_text(step):
+            meta.add_run("   ·   ")
+            meta.add_run(step_meta_text(step))
         # Prompt block in monospace.
         for line in step["prompt"].split("\n"):
             pp = doc.add_paragraph()
@@ -554,8 +686,8 @@ def build_pdf(task: str, workflow: dict) -> bytes:
                 )
             )
         meta = f"<b>Paste into:</b> {escape(step['app'])}"
-        if step.get("model", "").strip():
-            meta += f"   ·   <b>Suggested model/mode:</b> {escape(step['model'])}"
+        if step_meta_text(step):
+            meta += f"   ·   {escape(step_meta_text(step))}"
         flow.append(Paragraph(meta, styles["Normal"]))
         flow.append(Spacer(1, 4))
         flow.append(Paragraph(escape(step["prompt"]).replace("\n", "<br/>"), code_style))
@@ -635,6 +767,8 @@ def render_workflow(task: str, workflow: dict) -> None:
             caption = f"Paste in: **{step['app']}**"
             if step.get("model", "").strip():
                 caption += f" · Suggested model/mode: `{step['model']}`"
+            if step.get("effort", "").strip():
+                caption += f" · Effort: **{step['effort']}**"
             st.caption(caption)
             st.code(step["prompt"], language=None, wrap_lines=True)
 
@@ -644,7 +778,7 @@ def render_workflow(task: str, workflow: dict) -> None:
 
 def start_new_session() -> None:
     """Clear the current plan and inputs, keeping auth and API key."""
-    for key in ("workflow", "workflow_task", "task_input"):
+    for key in ("workflow", "workflow_task", "workflow_notes", "task_input"):
         st.session_state.pop(key, None)
 
 
@@ -679,6 +813,20 @@ def main() -> None:
         )
         client = get_client()
 
+    perplexity_key = get_perplexity_key()
+    if perplexity_key is None:
+        with st.expander("Live research (optional)"):
+            st.text_input(
+                "Perplexity API key",
+                type="password",
+                key="perplexity_key_input",
+                help=(
+                    "When set, the planner searches the web for current facts "
+                    "before designing your workflow. Never stored."
+                ),
+            )
+        perplexity_key = get_perplexity_key()
+
     selected_tools = st.multiselect(
         "Which AI tools do you have access to?",
         options=ALL_TOOLS,
@@ -701,6 +849,7 @@ def main() -> None:
     ):
         del st.session_state["workflow"]
         st.session_state.pop("workflow_task", None)
+        st.session_state.pop("workflow_notes", None)
 
     if st.button("Architect My Workflow", type="primary", use_container_width=True):
         if client is None:
@@ -713,15 +862,40 @@ def main() -> None:
             st.warning("Describe your task first.")
             st.stop()
 
+        notes = []
         try:
             with st.spinner("Analyzing task complexity…"):
                 route = route_task(client, task.strip())
+
+            research = None
+            if route.get("needs_research") and route.get("research_query", "").strip():
+                if perplexity_key:
+                    with st.spinner("Researching current information…"):
+                        research = run_research(
+                            perplexity_key, route["research_query"].strip()
+                        )
+                    if research:
+                        notes.append("🔎 Grounded in live Perplexity research.")
+                    else:
+                        notes.append(
+                            "🔎 Live research was unavailable — planned from "
+                            "built-in knowledge."
+                        )
+                else:
+                    notes.append(
+                        "🔎 This task would benefit from live research — add a "
+                        "Perplexity API key to enable it."
+                    )
+
             with st.spinner("Designing your workflow…"):
                 draft, _ = generate_workflow(
-                    client, task.strip(), route["complexity"], selected_tools
+                    client, task.strip(), route["complexity"], selected_tools,
+                    research=research,
                 )
-            with st.spinner("Running a final review…"):
-                workflow = review_workflow(client, task.strip(), selected_tools, draft)
+            with st.spinner("Running the final alignment review…"):
+                workflow = review_workflow(
+                    client, task.strip(), selected_tools, draft, research=research
+                )
         except anthropic.AuthenticationError:
             st.error("Invalid Anthropic API key.")
             st.stop()
@@ -740,9 +914,12 @@ def main() -> None:
 
         st.session_state["workflow"] = workflow
         st.session_state["workflow_task"] = task.strip()
+        st.session_state["workflow_notes"] = notes
 
     if "workflow" in st.session_state:
         st.divider()
+        for note in st.session_state.get("workflow_notes", []):
+            st.caption(note)
         render_workflow(st.session_state.get("workflow_task", ""), st.session_state["workflow"])
 
 

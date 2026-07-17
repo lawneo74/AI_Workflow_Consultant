@@ -121,3 +121,10 @@ calls the target function (e.g. `render_workflow`) with fixture data.
 - Catch Anthropic SDK typed exceptions most-specific-first
   (`AuthenticationError` → `RateLimitError` → `APIStatusError` →
   `APIConnectionError`); never string-match error messages.
+- The generator and reviewer (`claude-sonnet-5`) run adaptive thinking by
+  default, so thinking tokens share `max_tokens` with the JSON plan. Both
+  calls **stream** (`client.messages.stream(...).get_final_message()`) with
+  `PLAN_MAX_TOKENS` headroom — a non-streaming 8K budget truncated the plan
+  into invalid JSON, surfacing as "The planner returned an unexpected
+  response." Keep these calls streamed; only the router (Haiku, tiny output)
+  uses non-streaming `create`.

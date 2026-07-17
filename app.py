@@ -48,7 +48,7 @@ PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
 # truncates into invalid JSON. The SDK requires streaming for budgets this
 # large (and streaming also avoids HTTP timeouts), so these calls stream and
 # read the final message.
-PLAN_MAX_TOKENS = 16000
+PLAN_MAX_TOKENS = 160000
 
 # The catalog of tools the user may have. Each carries a routing description
 # (fed to the model) and a badge color (for the UI / step labels).

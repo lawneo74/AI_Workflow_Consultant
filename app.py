@@ -42,13 +42,29 @@ REVIEW_MODEL = "claude-sonnet-5"
 PERPLEXITY_RESEARCH_MODEL = "sonar-pro"
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
 
-# Output budget for the generator/reviewer. claude-sonnet-5 runs adaptive
-# thinking by default, so those tokens share max_tokens with the JSON plan;
-# a full multi-step plan with detailed prompts needs generous headroom or it
-# truncates into invalid JSON. The SDK requires streaming for budgets this
+# Desired output budget for the generator/reviewer. claude-sonnet-5 runs
+# adaptive thinking by default, so those tokens share max_tokens with the JSON
+# plan; a full multi-step plan with detailed prompts needs generous headroom or
+# it truncates into invalid JSON. The SDK requires streaming for budgets this
 # large (and streaming also avoids HTTP timeouts), so these calls stream and
 # read the final message.
+#
+# This is a *ceiling to aim for*, not the value sent to the API: each model
+# rejects (400) a max_tokens above its own output cap, so plan_budget() clamps
+# it to MODEL_MAX_OUTPUT_TOKENS per model before every call.
 PLAN_MAX_TOKENS = 160000
+
+# Per-model maximum output tokens. The Messages API returns a 400
+# invalid_request_error when max_tokens exceeds the model's cap.
+MODEL_MAX_OUTPUT_TOKENS = {
+    "claude-haiku-4-5": 64000,
+    "claude-sonnet-5": 128000,
+}
+
+
+def plan_budget(model: str) -> int:
+    """max_tokens for a planner call, clamped to the model's output cap."""
+    return min(PLAN_MAX_TOKENS, MODEL_MAX_OUTPUT_TOKENS.get(model, 64000))
 
 # The catalog of tools the user may have. Each carries a routing description
 # (fed to the model) and a badge color (for the UI / step labels).
@@ -477,7 +493,7 @@ def generate_workflow(
         content += f"\n\n---\n\nResearch findings (from a live web search):\n\n{research}"
     with client.messages.stream(
         model=model,
-        max_tokens=PLAN_MAX_TOKENS,
+        max_tokens=plan_budget(model),
         system=build_generator_system(selected_tools),
         output_config={
             "format": {"type": "json_schema", "schema": build_generator_schema(selected_tools)}
@@ -509,7 +525,7 @@ def review_workflow(
         content += f"\n\n---\n\nResearch findings (from a live web search):\n\n{research}"
     with client.messages.stream(
         model=REVIEW_MODEL,
-        max_tokens=PLAN_MAX_TOKENS,
+        max_tokens=plan_budget(REVIEW_MODEL),
         system=system,
         output_config={
             "format": {"type": "json_schema", "schema": build_review_schema(selected_tools)}

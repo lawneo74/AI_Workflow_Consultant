@@ -42,6 +42,14 @@ REVIEW_MODEL = "claude-sonnet-5"
 PERPLEXITY_RESEARCH_MODEL = "sonar-pro"
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
 
+# Output budget for the generator/reviewer. claude-sonnet-5 runs adaptive
+# thinking by default, so those tokens share max_tokens with the JSON plan;
+# a full multi-step plan with detailed prompts needs generous headroom or it
+# truncates into invalid JSON. The SDK requires streaming for budgets this
+# large (and streaming also avoids HTTP timeouts), so these calls stream and
+# read the final message.
+PLAN_MAX_TOKENS = 16000
+
 # The catalog of tools the user may have. Each carries a routing description
 # (fed to the model) and a badge color (for the UI / step labels).
 TOOL_CATALOG = {
@@ -442,7 +450,7 @@ def route_task(client: anthropic.Anthropic, task: str) -> dict:
     """Layer 1 — Haiku classifies task complexity and the need for research."""
     response = client.messages.create(
         model=ROUTER_MODEL,
-        max_tokens=300,
+        max_tokens=512,
         system=ROUTER_SYSTEM,
         output_config={"format": {"type": "json_schema", "schema": ROUTER_SCHEMA}},
         messages=[{"role": "user", "content": f"Task: {task}"}],
@@ -467,15 +475,16 @@ def generate_workflow(
     )
     if research:
         content += f"\n\n---\n\nResearch findings (from a live web search):\n\n{research}"
-    response = client.messages.create(
+    with client.messages.stream(
         model=model,
-        max_tokens=8000,
+        max_tokens=PLAN_MAX_TOKENS,
         system=build_generator_system(selected_tools),
         output_config={
             "format": {"type": "json_schema", "schema": build_generator_schema(selected_tools)}
         },
         messages=[{"role": "user", "content": content}],
-    )
+    ) as stream:
+        response = stream.get_final_message()
     return extract_json(response), model
 
 
@@ -498,15 +507,16 @@ def review_workflow(
     )
     if research:
         content += f"\n\n---\n\nResearch findings (from a live web search):\n\n{research}"
-    response = client.messages.create(
+    with client.messages.stream(
         model=REVIEW_MODEL,
-        max_tokens=8000,
+        max_tokens=PLAN_MAX_TOKENS,
         system=system,
         output_config={
             "format": {"type": "json_schema", "schema": build_review_schema(selected_tools)}
         },
         messages=[{"role": "user", "content": content}],
-    )
+    ) as stream:
+        response = stream.get_final_message()
     return extract_json(response)
 
 

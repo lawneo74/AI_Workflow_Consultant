@@ -33,15 +33,17 @@ list.
    `build_generator_system(selected_tools)` and bakes in
    `PROMPT_ENGINEERING_PRINCIPLES` + `CLAUDE_STEP_RULE`. Research findings,
    when present, are appended to the user message.
-4. **Reviewer** — `claude-sonnet-5` does a mandatory final quality pass
+4. **Reviewer** — `claude-sonnet-5` does a best-effort final quality pass
    (`review_workflow`): goal alignment is the first and most important check
    (the plan must fully deliver the user's stated goal), then tool routing,
    Claude model/effort presence, prompt quality, transitions, and coherence.
    It returns the improved plan plus a `review_summary` that states the
    alignment verdict; research findings are passed through for consistency
-   checking. Research/availability status notes are stored in
-   `st.session_state["workflow_notes"]` and rendered as captions above the
-   plan.
+   checking. If the review call fails (`anthropic.APIError` or a malformed
+   response), the run does not fail — the unreviewed generator draft is
+   returned as-is (no `review_summary`) and a `⚠️` note is added to
+   `st.session_state["workflow_notes"]`. Research/availability status notes
+   are also stored there and rendered as captions above the plan.
 
 Workflow payload: `strategy_summary`, `recommended_environments`,
 `effort_level` (Low/Medium/High), `steps[]` (each: `title`, `app` — one of the

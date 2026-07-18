@@ -94,7 +94,14 @@ Extended Thinking in the Claude app; empty string for other tools),
 `review_summary` (reviewer only). Steps routed to "Claude" must always carry
 both a model and an effort recommendation (`CLAUDE_STEP_RULE`, enforced by
 generator and reviewer); `render_workflow` and the exports show model/effort
-only when non-empty (`step_meta_text`).
+only when non-empty (`step_meta_text`). `TRANSITION_RULE` (in the generator
+and reviewer prompts) requires transitions to be concrete, app-specific
+handoff guidance (what to carry across and how), and — for Claude Code steps
+(app "Claude", model "Claude Code") — the one-time project setup (folder
+structure, CLAUDE.md, Skills/reference files), allowed even on a first step.
+The "no setup guides" rule is narrowed to account-signup/installation/
+usage-limit caveats and Perplexity MCP guides; Claude Code *project* setup is
+explicitly wanted.
 
 ## Exports & session
 

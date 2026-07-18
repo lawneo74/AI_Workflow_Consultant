@@ -327,6 +327,31 @@ CLAUDE_STEP_RULE = """\
   steps. For steps in other tools, "effort" must be an empty string (use
   "model" for a mode/model suggestion only when clearly useful)."""
 
+# Rule applied by both the generator and the reviewer: transitions must give
+# the user real, app-specific handoff guidance — and, for Claude Code steps,
+# the one-time project setup they need before running the prompt.
+TRANSITION_RULE = """\
+- Transitions are the user's guidance for moving from the previous step into
+  this one. Make them concrete and specific to the two apps involved — never a
+  generic "paste the output". When the app changes, state exactly what to
+  carry across and how: what to export or save, the file format to use, and
+  how to hand it to the next app (paste it, upload/attach the file, add it as
+  a source, or reference it). Fill "transition" whenever a handoff or setup
+  needs explaining; use an empty string only when the app is unchanged and
+  nothing needs carrying across.
+- Claude Code setup: when a step uses Claude Code (app "Claude" with "model"
+  set to "Claude Code"), its "transition" MUST first walk the user through the
+  one-time project setup before they run the prompt — even on a first step,
+  where the transition is the getting-started note:
+    - create a project folder with a sensible structure for the task (name the
+      key folders/files, e.g. src/, docs/, data/, tests/);
+    - add a CLAUDE.md at the project root capturing the project context, goal,
+      conventions, and constraints Claude Code should follow;
+    - add any Skills or reference files that will help (e.g. drop the user's
+      attached material into the project, or note a Skill to enable);
+    - then open Claude Code in that folder and run the step's prompt.
+  Keep this concise and actionable, tailored to the specific task."""
+
 
 def _tool_menu(selected_tools: list[str]) -> str:
     """Render the description block for the tools the user selected."""
@@ -379,10 +404,7 @@ Rules:
 - Every step must name the exact app to paste the prompt into (from the list
   above) and provide a complete, copy-paste-ready prompt for that app.
 {CLAUDE_STEP_RULE}
-- When a step runs in a different app than the previous step, fill
-  "transition" with a brief, practical note on how to carry the earlier
-  output across (e.g. how to export, copy, or re-attach it). Use an empty
-  string for the first step or when the app does not change.
+{TRANSITION_RULE}
 - "effort_level" reflects the user's expected hands-on effort: "Low",
   "Medium", or "High".
 - If the user attached reference material, ground the plan in it and make the
@@ -390,7 +412,10 @@ Rules:
 - If research findings are provided with the task, treat them as current,
   authoritative context: ground the strategy and step prompts in them
   (correct tool names, versions, and facts) instead of stale knowledge.
-- Do not include tool setup instructions or usage-limit caveats anywhere.
+- Do not include account-signup steps, installation instructions, or
+  usage-limit caveats, and never write a Perplexity MCP setup guide. (Claude
+  Code *project* setup — CLAUDE.md, Skills, folder structure — is the one
+  exception and IS wanted; it belongs in the transition per the rule above.)
 
 {PROMPT_ENGINEERING_PRINCIPLES}"""
 
@@ -447,7 +472,13 @@ Check and fix:
   Rewrite any prompt that falls short; a vague or generic prompt is a defect.
 - Attachments: if the user attached reference material, the prompts must
   direct each app to the relevant attached content.
-- Transitions: present and accurate wherever the app changes; empty otherwise.
+- Transitions: concrete and app-specific wherever context moves between
+  apps — the user must know exactly what to carry across and how (export,
+  save, paste, upload/attach, or add as a source). Every Claude Code step
+  (app "Claude", model "Claude Code") must carry its one-time project setup
+  in the transition: project folder structure, a CLAUDE.md capturing context
+  and conventions, and any Skills or reference files. Empty only when nothing
+  needs carrying across. Add or rewrite any transition that falls short.
 - Coherence: steps flow logically and together fully accomplish the task.
 - If research findings accompany the task, the plan must be consistent with
   them (current tool names, versions, and facts).
@@ -456,8 +487,10 @@ Rewrite and tighten prompts as needed. Then write a short "review_summary"
 (2-3 sentences) that states explicitly whether the final plan is aligned with
 the user's goal, confirms it is the simplest sufficient plan (mention when
 alternative candidates were compared), and notes what you verified or
-improved. Do not include tool setup instructions or usage-limit caveats
-anywhere.
+improved. Do not include account-signup steps, installation instructions, or
+usage-limit caveats, and never write a Perplexity MCP setup guide — but keep
+Claude Code *project* setup (CLAUDE.md, Skills, folder structure) in the
+relevant transition.
 
 {principles}"""
 
@@ -501,8 +534,12 @@ def _workflow_properties(selected_tools: list[str]) -> dict:
                     "transition": {
                         "type": "string",
                         "description": (
-                            "How to move context from the previous step into "
-                            "this app. Empty string if not needed."
+                            "Concrete, app-specific guidance for moving from "
+                            "the previous step into this one: what to carry "
+                            "across and how (export/save/paste/upload/attach). "
+                            "For Claude Code steps, also the one-time project "
+                            "setup (folder structure, CLAUDE.md, Skills). "
+                            "Empty string when nothing needs carrying across."
                         ),
                     },
                     "prompt": {

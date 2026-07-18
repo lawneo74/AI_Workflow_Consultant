@@ -37,10 +37,30 @@ import streamlit as st
 
 ROUTER_MODEL = "claude-haiku-4-5"
 SIMPLE_GENERATOR_MODEL = "claude-haiku-4-5"
-COMPLEX_GENERATOR_MODEL = "claude-sonnet-5"
+COMPLEX_GENERATOR_MODEL = "claude-opus-4-8"
 REVIEW_MODEL = "claude-sonnet-5"
 PERPLEXITY_RESEARCH_MODEL = "sonar-pro"
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
+
+# Rich tool-capabilities knowledge base, maintained as Markdown in the repo
+# (editable directly on GitHub — see the note at the top of the file). Loaded
+# once per script run; if missing or unreadable the planner falls back to the
+# built-in TOOL_CATALOG descriptions.
+TOOL_CAPABILITIES_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tool_capabilities.md"
+)
+
+
+def load_tool_capabilities() -> str | None:
+    try:
+        with open(TOOL_CAPABILITIES_FILE, encoding="utf-8") as f:
+            text = f.read().strip()
+        return text or None
+    except OSError:
+        return None
+
+
+TOOL_CAPABILITIES = load_tool_capabilities()
 
 # Desired output budget for the generator/reviewer. claude-sonnet-5 runs
 # adaptive thinking by default, so those tokens share max_tokens with the JSON
@@ -59,12 +79,122 @@ PLAN_MAX_TOKENS = 160000
 MODEL_MAX_OUTPUT_TOKENS = {
     "claude-haiku-4-5": 64000,
     "claude-sonnet-5": 128000,
+    "claude-opus-4-8": 128000,
 }
 
 
 def plan_budget(model: str) -> int:
     """max_tokens for a planner call, clamped to the model's output cap."""
     return min(PLAN_MAX_TOKENS, MODEL_MAX_OUTPUT_TOKENS.get(model, 64000))
+
+
+def thinking_kwargs(model: str) -> dict:
+    """Thinking config per model. claude-opus-4-8 runs without thinking unless
+    adaptive thinking is requested explicitly; claude-sonnet-5 runs adaptive by
+    default, and claude-haiku-4-5 uses the legacy budget style — so only Opus
+    needs the explicit parameter."""
+    if model == "claude-opus-4-8":
+        return {"thinking": {"type": "adaptive"}}
+    return {}
+
+
+# --------------------------------------------------------------------------- #
+# Context attachments (MD / DOCX / PPTX)                                       #
+# --------------------------------------------------------------------------- #
+
+ATTACHMENT_TYPES = ["md", "docx", "pptx"]
+MAX_ATTACHMENT_CHARS = 20_000  # per file, after extraction
+MAX_CONTEXT_CHARS = 60_000  # total across all attachments
+ROUTER_CONTEXT_CHARS = 4_000  # the router only needs a taste for classification
+
+
+def extract_attachment_text(name: str, data: bytes) -> str | None:
+    """Best-effort plain-text extraction from an uploaded file.
+
+    Returns None when the file can't be parsed — the caller warns and
+    continues, matching the app's best-effort philosophy.
+    """
+    lower = name.lower()
+    try:
+        if lower.endswith(".md"):
+            return data.decode("utf-8", errors="replace")
+        if lower.endswith(".docx"):
+            from docx import Document
+
+            doc = Document(io.BytesIO(data))
+            parts = [p.text for p in doc.paragraphs if p.text.strip()]
+            for table in doc.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells]
+                    if any(cells):
+                        parts.append(" | ".join(cells))
+            return "\n".join(parts)
+        if lower.endswith(".pptx"):
+            from pptx import Presentation
+
+            prs = Presentation(io.BytesIO(data))
+            parts = []
+            for i, slide in enumerate(prs.slides, start=1):
+                texts = [
+                    shape.text_frame.text.strip()
+                    for shape in slide.shapes
+                    if shape.has_text_frame and shape.text_frame.text.strip()
+                ]
+                if slide.has_notes_slide:
+                    note = slide.notes_slide.notes_text_frame.text.strip()
+                    if note:
+                        texts.append(f"(Speaker notes: {note})")
+                if texts:
+                    parts.append(f"[Slide {i}]\n" + "\n".join(texts))
+            return "\n\n".join(parts)
+    except ModuleNotFoundError:
+        return None
+    except Exception:
+        return None
+    return None
+
+
+def build_attachment_context(files) -> tuple[str, list[str], list[str]]:
+    """Extract text from uploaded files into one planning-context block.
+
+    Returns (context_text, included_filenames, notes). Oversized content is
+    truncated with a visible note; unreadable files warn and are skipped.
+    """
+    sections: list[str] = []
+    included: list[str] = []
+    notes: list[str] = []
+    total = 0
+    for f in files or []:
+        text = extract_attachment_text(f.name, f.getvalue())
+        if text is None or not text.strip():
+            notes.append(f"⚠️ Couldn't read “{f.name}” — it was skipped.")
+            continue
+        text = text.strip()
+        if len(text) > MAX_ATTACHMENT_CHARS:
+            text = text[:MAX_ATTACHMENT_CHARS]
+            notes.append(f"📎 “{f.name}” was long — only the first part was used.")
+        if total + len(text) > MAX_CONTEXT_CHARS:
+            text = text[: max(0, MAX_CONTEXT_CHARS - total)]
+            if not text:
+                notes.append(f"📎 “{f.name}” was skipped — context limit reached.")
+                continue
+            notes.append(f"📎 “{f.name}” was truncated — context limit reached.")
+        total += len(text)
+        included.append(f.name)
+        sections.append(f'--- Attachment: "{f.name}" ---\n{text}')
+    return "\n\n".join(sections), included, notes
+
+
+def compose_task_context(task: str, attachment_context: str, limit: int | None = None) -> str:
+    """The task plus attached reference material, as sent to the planner."""
+    if not attachment_context:
+        return task
+    context = attachment_context if limit is None else attachment_context[:limit]
+    return (
+        f"{task}\n\n"
+        "Reference material attached by the user (use it as authoritative "
+        f"context for this task):\n\n{context}"
+    )
 
 # The catalog of tools the user may have. Each carries a routing description
 # (fed to the model) and a badge color (for the UI / step labels).
@@ -154,24 +284,36 @@ ROUTER_SCHEMA = {
 
 # Professional prompt-engineering principles the generated prompts must embody.
 PROMPT_ENGINEERING_PRINCIPLES = """\
-Every "prompt" you write must be a polished, professional prompt that the user
-can paste verbatim. Apply these prompt-engineering principles to each one:
+You write every step "prompt" in the capacity of a senior professional prompt
+engineer: each one must be a production-quality prompt the user can paste
+verbatim and get an excellent result on the first try. Hold every prompt to
+this bar:
 
-- Role & context: open by assigning the target app a clear expert persona and
-  the context it needs to do the job well.
-- Explicit task: state the objective precisely and unambiguously.
-- Inputs & references: reference any artifact produced by earlier steps and
-  tell the app exactly what to use it for.
-- Structure with delimiters: use headings, numbered requirements, or delimiters
-  (e.g. triple backticks, ### sections) to separate instructions from content.
-- Output specification: define the exact format, length, and structure of the
-  expected output.
-- Constraints & success criteria: list what to do, what to avoid, and how the
-  user will judge the result as done.
-- Reasoning guidance: for analytical or multi-step prompts, ask the app to
-  think step by step or to plan before producing the final answer.
-- Tone & audience: specify the intended audience and register when relevant.
-Keep prompts specific and self-contained — never write a vague one-liner."""
+- Role & context: open by assigning the target app a specific expert persona
+  (not a generic "assistant") and give it the situational context it needs —
+  who the work is for, why it matters, and what came before this step.
+- Explicit deliverable: state the objective and the concrete deliverable
+  precisely and unambiguously; never leave the app to guess scope.
+- Inputs & references: name every input the step depends on — the user's
+  attached reference material and artifacts produced by earlier steps — and
+  say exactly how each should be used.
+- Structure with delimiters: separate instructions from content with headings,
+  numbered requirements, or delimiters (### sections, triple backticks) so the
+  app can't confuse the two.
+- Output specification: define the exact format, length, structure, and file
+  type of the expected output, including section-by-section outlines for
+  documents and column definitions for tabular work.
+- Constraints & edge cases: list what to do, what to avoid, boundary
+  conditions to respect, and assumptions to surface rather than silently make.
+- Success criteria & self-check: end analytical prompts by stating how the
+  result will be judged and asking the app to verify its output against those
+  criteria before finishing.
+- Reasoning guidance: for multi-step or analytical work, direct the app to
+  plan or reason through the problem before producing the final answer.
+- Tone & audience: specify the intended audience, register, and level of
+  detail whenever the deliverable is user-facing prose.
+Keep every prompt specific and self-contained — a reader with no other context
+must be able to execute it. Never write a vague one-liner."""
 
 # Rule applied by both the generator and the reviewer: Claude steps must carry
 # a concrete model + effort recommendation.
@@ -193,16 +335,45 @@ def _tool_menu(selected_tools: list[str]) -> str:
     )
 
 
+def _capabilities_block() -> str:
+    """The maintained capabilities knowledge base, when available."""
+    if not TOOL_CAPABILITIES:
+        return ""
+    return f"""
+Use this maintained tool-capabilities knowledge base as your authoritative
+reference for each tool's strengths, output formats, weaknesses, and proven
+tool sequences. Note: finer-grained capabilities it mentions (Claude Code,
+Claude Projects, Perplexity Deep Research / Computer / Spaces, Nano Banana)
+are modes WITHIN the routable tools — a step's "app" must always be one of
+the user's tools listed above, and the specific mode belongs in the step's
+"model" field and prompt text (e.g. app "Claude" with model "Claude Code",
+or app "Perplexity AI" with model "Deep Research").
+
+<tool_capabilities>
+{TOOL_CAPABILITIES}
+</tool_capabilities>
+"""
+
+
+SIMPLICITY_RULE = """\
+- Simplicity is the product's core promise: recommend the SIMPLEST workflow
+  that fully delivers the goal. A single step in a single tool is the ideal
+  outcome whenever it is genuinely sufficient — add steps or tools only when
+  each one is necessary to reach the stated goal."""
+
+
 def build_generator_system(selected_tools: list[str]) -> str:
     return f"""\
-You are an AI workflow architect. The user has access to ONLY the following
-tools — you must never route a step to any tool outside this list:
+You are an AI workflow architect and senior professional prompt engineer. The
+user has access to ONLY the following tools — you must never route a step to
+any tool outside this list:
 
 {_tool_menu(selected_tools)}
-
+{_capabilities_block()}
 Given a task, design the optimal chained workflow across these tools.
 
 Rules:
+{SIMPLICITY_RULE}
 - Choose the fewest tools that genuinely fit the task. Use a multi-app chain
   only when different phases clearly belong in different tools.
 - Every step must name the exact app to paste the prompt into (from the list
@@ -214,6 +385,8 @@ Rules:
   string for the first step or when the app does not change.
 - "effort_level" reflects the user's expected hands-on effort: "Low",
   "Medium", or "High".
+- If the user attached reference material, ground the plan in it and make the
+  step prompts point the target app at the relevant attached content.
 - If research findings are provided with the task, treat them as current,
   authoritative context: ground the strategy and step prompts in them
   (correct tool names, versions, and facts) instead of stale knowledge.
@@ -222,28 +395,58 @@ Rules:
 {PROMPT_ENGINEERING_PRINCIPLES}"""
 
 
+def build_candidates_system(selected_tools: list[str]) -> str:
+    """System prompt for the complex path: multiple candidates, then select."""
+    return f"""\
+{build_generator_system(selected_tools)}
+
+This task is non-trivial, so follow this two-phase procedure:
+
+Phase 1 — Generate 2 to 3 GENUINELY DIFFERENT candidate workflows. Candidates
+must differ in strategy or tool sequence (e.g. different lead tool, different
+phase structure, single-tool vs. chained), not be cosmetic variants of one
+plan. Every candidate must independently satisfy all the rules above and
+fully deliver the user's goal.
+
+Phase 2 — Select the winner: the SIMPLEST candidate that fully delivers the
+goal. Goal completeness is a hard gate — never pick an incomplete plan just
+because it is shorter. Among goal-complete candidates, prefer the fewest
+steps, then the fewest tool switches, then the least hands-on user effort.
+Set "selected_index" to the winner's zero-based position in "candidates" and
+explain the choice in "selection_rationale" (1-2 sentences: why this one is
+the simplest that gets the job done)."""
+
+
 REVIEW_SYSTEM_TEMPLATE = """\
-You are a senior prompt-engineering reviewer performing the FINAL quality pass
-on a drafted AI workflow before it reaches the user. The user has access to
-ONLY these tools — every step must stay within this list:
+You are a senior professional prompt engineer performing the FINAL quality
+pass on a drafted AI workflow before it reaches the user. The user has access
+to ONLY these tools — every step must stay within this list:
 
 {menu}
-
+{capabilities}
 Critically review the draft workflow and return an improved final version.
 Check and fix:
 - Goal alignment (most important): executing the workflow step by step must
   fully deliver the user's stated goal — nothing missing, no scope drift, no
   steps the user did not ask for, and the final step produces the intended
   deliverable. Rework the plan if it falls short.
+- Simplicity: this must be the simplest workflow that fully delivers the
+  goal. Remove any step or tool switch the goal does not require; merge steps
+  that one tool can complete in a single prompt. Never simplify away
+  something the goal needs.
 - Tool routing: every step uses an allowed tool and the best-fit tool for its
-  phase; the chain uses the fewest tools that genuinely fit.
+  phase per the capabilities reference; the chain uses the fewest tools that
+  genuinely fit.
 - Claude recommendations: every step routed to "Claude" carries a concrete
   Claude model in "model" and an "effort" of "Low", "Medium", or "High" (the
   /effort setting in Claude Code, or Extended Thinking in the Claude app when
   "High"); steps in other tools keep "effort" as an empty string.
-- Prompt quality: each prompt applies professional prompt-engineering
-  principles — clear role/context, explicit task, structured output spec,
-  constraints, success criteria, and references to prior steps' outputs.
+- Prompt craftsmanship: each prompt must meet the senior-prompt-engineer bar
+  defined below — specific expert role, explicit deliverable, named inputs,
+  delimited structure, exact output spec, constraints, and success criteria.
+  Rewrite any prompt that falls short; a vague or generic prompt is a defect.
+- Attachments: if the user attached reference material, the prompts must
+  direct each app to the relevant attached content.
 - Transitions: present and accurate wherever the app changes; empty otherwise.
 - Coherence: steps flow logically and together fully accomplish the task.
 - If research findings accompany the task, the plan must be consistent with
@@ -251,8 +454,10 @@ Check and fix:
 
 Rewrite and tighten prompts as needed. Then write a short "review_summary"
 (2-3 sentences) that states explicitly whether the final plan is aligned with
-the user's goal and what you verified or improved. Do not include tool setup
-instructions or usage-limit caveats anywhere.
+the user's goal, confirms it is the simplest sufficient plan (mention when
+alternative candidates were compared), and notes what you verified or
+improved. Do not include tool setup instructions or usage-limit caveats
+anywhere.
 
 {principles}"""
 
@@ -322,6 +527,38 @@ def build_generator_schema(selected_tools: list[str]) -> dict:
             "effort_level",
             "steps",
         ],
+        "additionalProperties": False,
+    }
+
+
+def build_candidates_schema(selected_tools: list[str]) -> dict:
+    """Schema for the complex path: 2-3 candidate workflows plus a selection."""
+    return {
+        "type": "object",
+        "properties": {
+            "candidates": {
+                "type": "array",
+                "items": build_generator_schema(selected_tools),
+                "description": (
+                    "2-3 genuinely different candidate workflows, each of "
+                    "which fully delivers the user's goal."
+                ),
+            },
+            "selected_index": {
+                "type": "integer",
+                "description": (
+                    "Zero-based index of the simplest goal-complete candidate."
+                ),
+            },
+            "selection_rationale": {
+                "type": "string",
+                "description": (
+                    "1-2 sentences on why the selected candidate is the "
+                    "simplest workflow that gets the job done."
+                ),
+            },
+        },
+        "required": ["candidates", "selected_index", "selection_rationale"],
         "additionalProperties": False,
     }
 
@@ -499,9 +736,58 @@ def generate_workflow(
             "format": {"type": "json_schema", "schema": build_generator_schema(selected_tools)}
         },
         messages=[{"role": "user", "content": content}],
+        **thinking_kwargs(model),
     ) as stream:
         response = stream.get_final_message()
     return extract_json(response), model
+
+
+def generate_candidate_workflows(
+    client: anthropic.Anthropic,
+    task: str,
+    selected_tools: list[str],
+    research: str | None = None,
+) -> dict:
+    """Layer 2 (complex path) — Opus drafts 2-3 candidates and selects the
+    simplest one that fully delivers the goal."""
+    model = COMPLEX_GENERATOR_MODEL
+    content = (
+        f"Available tools: {', '.join(selected_tools)}\n\n"
+        f"Design candidate workflows for this task and select the simplest "
+        f"one that gets the job done:\n\n{task}"
+    )
+    if research:
+        content += f"\n\n---\n\nResearch findings (from a live web search):\n\n{research}"
+    with client.messages.stream(
+        model=model,
+        max_tokens=plan_budget(model),
+        system=build_candidates_system(selected_tools),
+        output_config={
+            "format": {"type": "json_schema", "schema": build_candidates_schema(selected_tools)}
+        },
+        messages=[{"role": "user", "content": content}],
+        **thinking_kwargs(model),
+    ) as stream:
+        response = stream.get_final_message()
+    return extract_json(response)
+
+
+def pick_selected_candidate(payload: dict) -> tuple[dict, int, str]:
+    """Validate the candidates payload and return (workflow, count, rationale).
+
+    Raises KeyError/IndexError/TypeError on a malformed payload — callers
+    treat that as "candidate comparison unavailable" and fall back.
+    """
+    candidates = payload["candidates"]
+    if not isinstance(candidates, list) or not candidates:
+        raise KeyError("candidates")
+    index = payload.get("selected_index", 0)
+    if not isinstance(index, int) or not (0 <= index < len(candidates)):
+        index = 0
+    workflow = candidates[index]
+    if not isinstance(workflow, dict) or "steps" not in workflow:
+        raise KeyError("steps")
+    return workflow, len(candidates), str(payload.get("selection_rationale", ""))
 
 
 def review_workflow(
@@ -510,10 +796,12 @@ def review_workflow(
     selected_tools: list[str],
     draft: dict,
     research: str | None = None,
+    selection_note: str | None = None,
 ) -> dict:
     """Layer 3 — Sonnet reviews goal alignment and returns the polished plan."""
     system = REVIEW_SYSTEM_TEMPLATE.format(
         menu=_tool_menu(selected_tools),
+        capabilities=_capabilities_block(),
         principles=PROMPT_ENGINEERING_PRINCIPLES,
     )
     content = (
@@ -521,6 +809,12 @@ def review_workflow(
         f"Original task:\n{task}\n\n"
         f"Draft workflow to review (JSON):\n{json.dumps(draft, indent=2)}"
     )
+    if selection_note:
+        content += (
+            f"\n\n---\n\nThis draft was selected from multiple candidate "
+            f"workflows as the simplest that delivers the goal. Selection "
+            f"rationale: {selection_note}"
+        )
     if research:
         content += f"\n\n---\n\nResearch findings (from a live web search):\n\n{research}"
     with client.messages.stream(
@@ -559,8 +853,11 @@ def step_meta_text(step: dict) -> str:
 # Downloadable exports                                                          #
 # --------------------------------------------------------------------------- #
 
-def build_markdown(task: str, workflow: dict) -> str:
-    lines = ["# AI Workflow Plan", "", f"**Task:** {task}", "", "## Strategy", ""]
+def build_markdown(task: str, workflow: dict, attachments: list[str] | None = None) -> str:
+    lines = ["# AI Workflow Plan", "", f"**Task:** {task}", ""]
+    if attachments:
+        lines += [f"**Context files:** {', '.join(attachments)}", ""]
+    lines += ["## Strategy", ""]
     lines.append(
         "**Recommended tools:** "
         + ", ".join(workflow.get("recommended_environments", []))
@@ -595,7 +892,7 @@ def build_markdown(task: str, workflow: dict) -> str:
     return "\n".join(lines)
 
 
-def build_docx(task: str, workflow: dict) -> bytes:
+def build_docx(task: str, workflow: dict, attachments: list[str] | None = None) -> bytes:
     from docx import Document
     from docx.shared import Pt, RGBColor
 
@@ -605,6 +902,10 @@ def build_docx(task: str, workflow: dict) -> bytes:
     p = doc.add_paragraph()
     p.add_run("Task: ").bold = True
     p.add_run(task)
+    if attachments:
+        p = doc.add_paragraph()
+        p.add_run("Context files: ").bold = True
+        p.add_run(", ".join(attachments))
 
     doc.add_heading("Strategy", level=1)
     p = doc.add_paragraph()
@@ -645,7 +946,7 @@ def build_docx(task: str, workflow: dict) -> bytes:
     return buf.getvalue()
 
 
-def build_pdf(task: str, workflow: dict) -> bytes:
+def build_pdf(task: str, workflow: dict, attachments: list[str] | None = None) -> bytes:
     from xml.sax.saxutils import escape
 
     from reportlab.lib.enums import TA_LEFT
@@ -679,6 +980,11 @@ def build_pdf(task: str, workflow: dict) -> bytes:
     )
     flow = [para("AI Workflow Plan", "Title")]
     flow += [para(f"<b>Task:</b> {escape(task)}"), Spacer(1, 10)]
+    if attachments:
+        flow += [
+            para(f"<b>Context files:</b> {', '.join(attachments)}"),
+            Spacer(1, 10),
+        ]
 
     flow.append(para("Strategy", "Heading1"))
     flow.append(
@@ -723,20 +1029,22 @@ def build_pdf(task: str, workflow: dict) -> bytes:
     return buf.getvalue()
 
 
-def render_downloads(task: str, workflow: dict) -> None:
+def render_downloads(
+    task: str, workflow: dict, attachments: list[str] | None = None
+) -> None:
     st.markdown("**Download this plan**")
     col_md, col_docx, col_pdf = st.columns(3)
     with col_md:
         st.download_button(
             "⬇️ Markdown",
-            data=build_markdown(task, workflow),
+            data=build_markdown(task, workflow, attachments),
             file_name="ai_workflow_plan.md",
             mime="text/markdown",
             use_container_width=True,
         )
     with col_docx:
         try:
-            docx_bytes = build_docx(task, workflow)
+            docx_bytes = build_docx(task, workflow, attachments)
             st.download_button(
                 "⬇️ Word (.docx)",
                 data=docx_bytes,
@@ -748,7 +1056,7 @@ def render_downloads(task: str, workflow: dict) -> None:
             st.button("Word (.docx)", disabled=True, help="python-docx not installed", use_container_width=True)
     with col_pdf:
         try:
-            pdf_bytes = build_pdf(task, workflow)
+            pdf_bytes = build_pdf(task, workflow, attachments)
             st.download_button(
                 "⬇️ PDF",
                 data=pdf_bytes,
@@ -760,7 +1068,9 @@ def render_downloads(task: str, workflow: dict) -> None:
             st.button("PDF", disabled=True, help="reportlab not installed", use_container_width=True)
 
 
-def render_workflow(task: str, workflow: dict) -> None:
+def render_workflow(
+    task: str, workflow: dict, attachments: list[str] | None = None
+) -> None:
     st.subheader("Strategy")
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -799,12 +1109,19 @@ def render_workflow(task: str, workflow: dict) -> None:
             st.code(step["prompt"], language=None, wrap_lines=True)
 
     st.divider()
-    render_downloads(task, workflow)
+    render_downloads(task, workflow, attachments)
 
 
 def start_new_session() -> None:
     """Clear the current plan and inputs, keeping auth and API key."""
-    for key in ("workflow", "workflow_task", "workflow_notes", "task_input"):
+    for key in (
+        "workflow",
+        "workflow_task",
+        "workflow_notes",
+        "workflow_attachments",
+        "workflow_context_sig",
+        "task_input",
+    ):
         st.session_state.pop(key, None)
 
 
@@ -868,14 +1185,31 @@ def main() -> None:
         placeholder="e.g. Research AI agent frameworks in 2026 and write a whitepaper.",
     )
 
-    # Editing the input invalidates the previous result: clear it from memory
-    # so a stale workflow is never shown alongside a different task.
-    if "workflow" in st.session_state and task.strip() != st.session_state.get(
-        "workflow_task"
+    uploaded_files = st.file_uploader(
+        "Attach reference files (optional)",
+        type=ATTACHMENT_TYPES,
+        accept_multiple_files=True,
+        key="context_files",
+        help=(
+            "Markdown, Word (.docx), or PowerPoint (.pptx) files whose "
+            "content gives the planner context about your task."
+        ),
+    )
+    context_sig = ";".join(
+        f"{f.name}:{f.size}" for f in (uploaded_files or [])
+    )
+
+    # Editing the task or changing attachments invalidates the previous
+    # result: clear it from memory so a stale workflow is never shown next to
+    # different inputs.
+    if "workflow" in st.session_state and (
+        task.strip() != st.session_state.get("workflow_task")
+        or context_sig != st.session_state.get("workflow_context_sig", "")
     ):
         del st.session_state["workflow"]
-        st.session_state.pop("workflow_task", None)
-        st.session_state.pop("workflow_notes", None)
+        for key in ("workflow_task", "workflow_notes", "workflow_attachments",
+                    "workflow_context_sig"):
+            st.session_state.pop(key, None)
 
     if st.button("Architect My Workflow", type="primary", use_container_width=True):
         if client is None:
@@ -888,10 +1222,20 @@ def main() -> None:
             st.warning("Describe your task first.")
             st.stop()
 
-        notes = []
+        with st.spinner("Reading attached files…" if uploaded_files else "Preparing…"):
+            attachment_context, attachment_names, notes = build_attachment_context(
+                uploaded_files
+            )
+        if attachment_names:
+            notes.append("📎 Planned with context from: " + ", ".join(attachment_names))
+        planner_task = compose_task_context(task.strip(), attachment_context)
+        router_task = compose_task_context(
+            task.strip(), attachment_context, limit=ROUTER_CONTEXT_CHARS
+        )
+
         try:
             with st.spinner("Analyzing task complexity…"):
-                route = route_task(client, task.strip())
+                route = route_task(client, router_task)
 
             research = None
             if route.get("needs_research") and route.get("research_query", "").strip():
@@ -913,11 +1257,41 @@ def main() -> None:
                         "Perplexity API key to enable it."
                     )
 
-            with st.spinner("Designing your workflow…"):
-                draft, _ = generate_workflow(
-                    client, task.strip(), route["complexity"], selected_tools,
-                    research=research,
-                )
+            # Non-simple tasks: draft 2-3 genuinely different candidate
+            # workflows and keep the simplest one that fully delivers the
+            # goal. Best-effort — if the candidate pass fails, fall back to
+            # the single-workflow path below.
+            draft = None
+            selection_note = None
+            if route["complexity"] == "complex":
+                try:
+                    with st.spinner("Designing candidate workflows…"):
+                        payload = generate_candidate_workflows(
+                            client, planner_task, selected_tools, research=research
+                        )
+                    draft, n_candidates, selection_note = pick_selected_candidate(
+                        payload
+                    )
+                    notes.append(
+                        f"⚖️ Compared {n_candidates} candidate workflows — "
+                        "presenting the simplest that fully delivers the goal."
+                    )
+                except (
+                    anthropic.APIError,
+                    json.JSONDecodeError,
+                    StopIteration,
+                    KeyError,
+                    IndexError,
+                    TypeError,
+                ):
+                    draft = None
+
+            if draft is None:
+                with st.spinner("Designing your workflow…"):
+                    draft, _ = generate_workflow(
+                        client, planner_task, route["complexity"], selected_tools,
+                        research=research,
+                    )
         except anthropic.AuthenticationError:
             st.error("Invalid Anthropic API key.")
             st.stop()
@@ -940,7 +1314,8 @@ def main() -> None:
         try:
             with st.spinner("Running the final alignment review…"):
                 workflow = review_workflow(
-                    client, task.strip(), selected_tools, draft, research=research
+                    client, planner_task, selected_tools, draft,
+                    research=research, selection_note=selection_note,
                 )
         except (
             anthropic.APIError,
@@ -957,12 +1332,18 @@ def main() -> None:
         st.session_state["workflow"] = workflow
         st.session_state["workflow_task"] = task.strip()
         st.session_state["workflow_notes"] = notes
+        st.session_state["workflow_attachments"] = attachment_names
+        st.session_state["workflow_context_sig"] = context_sig
 
     if "workflow" in st.session_state:
         st.divider()
         for note in st.session_state.get("workflow_notes", []):
             st.caption(note)
-        render_workflow(st.session_state.get("workflow_task", ""), st.session_state["workflow"])
+        render_workflow(
+            st.session_state.get("workflow_task", ""),
+            st.session_state["workflow"],
+            attachments=st.session_state.get("workflow_attachments") or None,
+        )
 
 
 if __name__ == "__main__":

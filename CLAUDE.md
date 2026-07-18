@@ -28,22 +28,62 @@ list.
    in-app expander shown only when unconfigured). This is pre-generation
    context gathering — it does NOT execute generated prompts, so it doesn't
    violate the no-execution constraint below.
-3. **Generator** — simple → Haiku, complex → `claude-sonnet-5`
-   (`generate_workflow`). System prompt is built per-request by
-   `build_generator_system(selected_tools)` and bakes in
-   `PROMPT_ENGINEERING_PRINCIPLES` + `CLAUDE_STEP_RULE`. Research findings,
-   when present, are appended to the user message.
+3. **Generator** — simple → Haiku via `generate_workflow` (one minimal plan);
+   complex → `claude-opus-4-8` via `generate_candidate_workflows`, which
+   returns 2–3 genuinely different candidates plus a `selected_index` /
+   `selection_rationale` (the simplest goal-complete candidate,
+   `build_candidates_schema`). `pick_selected_candidate` validates the
+   payload; any failure in the candidate pass falls back to the
+   single-workflow `generate_workflow` path (best-effort, never fails the
+   run). System prompts are built per-request by
+   `build_generator_system(selected_tools)` /
+   `build_candidates_system(selected_tools)` and bake in the maintained
+   capabilities KB (`_capabilities_block`), `SIMPLICITY_RULE`,
+   `PROMPT_ENGINEERING_PRINCIPLES` (senior-prompt-engineer bar) +
+   `CLAUDE_STEP_RULE`. Research findings, when present, are appended to the
+   user message. Opus calls pass `thinking={"type": "adaptive"}` via
+   `thinking_kwargs` (Opus 4.8 doesn't think unless asked; Sonnet 5 is
+   adaptive by default).
 4. **Reviewer** — `claude-sonnet-5` does a best-effort final quality pass
    (`review_workflow`): goal alignment is the first and most important check
-   (the plan must fully deliver the user's stated goal), then tool routing,
-   Claude model/effort presence, prompt quality, transitions, and coherence.
-   It returns the improved plan plus a `review_summary` that states the
-   alignment verdict; research findings are passed through for consistency
-   checking. If the review call fails (`anthropic.APIError` or a malformed
-   response), the run does not fail — the unreviewed generator draft is
-   returned as-is (no `review_summary`) and a `⚠️` note is added to
-   `st.session_state["workflow_notes"]`. Research/availability status notes
-   are also stored there and rendered as captions above the plan.
+   (the plan must fully deliver the user's stated goal), then simplicity
+   (simplest sufficient plan), tool routing per the capabilities KB, Claude
+   model/effort presence, prompt craftsmanship (senior-prompt-engineer bar),
+   transitions, and coherence. It receives the candidate `selection_note`
+   when one exists and returns the improved plan plus a `review_summary`
+   that states the alignment verdict; research findings are passed through
+   for consistency checking. If the review call fails (`anthropic.APIError`
+   or a malformed response), the run does not fail — the unreviewed
+   generator draft is returned as-is (no `review_summary`) and a `⚠️` note
+   is added to `st.session_state["workflow_notes"]`. Research/availability/
+   attachment status notes are also stored there and rendered as captions
+   above the plan.
+
+## Tool-capabilities knowledge base
+
+`tool_capabilities.md` (repo root) is the maintained capabilities write-up
+(strengths/output-formats table + proven tool sequences). Loaded once per
+script run by `load_tool_capabilities()` into `TOOL_CAPABILITIES` and
+injected into the generator/candidates/reviewer system prompts via
+`_capabilities_block()` inside `<tool_capabilities>` tags. Missing/unreadable
+file → `None` → prompts fall back to the built-in `TOOL_CATALOG`
+descriptions (never crash). It is prompt context, not parsed config —
+maintainers edit it directly in the GitHub UI (pencil icon → commit) and the
+app picks it up on next restart. Finer-grained modes it mentions (Claude
+Code, Perplexity Deep Research, etc.) are expressed through a step's
+`model` field, never as a routed `app` value.
+
+## Context attachments
+
+`st.file_uploader` (multi-file, `ATTACHMENT_TYPES` = md/docx/pptx) feeds
+`build_attachment_context` → `extract_attachment_text` (python-docx /
+python-pptx; best-effort, unreadable files warn and are skipped). Caps:
+`MAX_ATTACHMENT_CHARS` per file, `MAX_CONTEXT_CHARS` total, truncation notes
+in `workflow_notes`. `compose_task_context` appends the extracted text to
+the task for planner calls (router gets only `ROUTER_CONTEXT_CHARS`).
+Attachment filenames live in `st.session_state["workflow_attachments"]` and
+are shown in exports ("Context files"); the exports/render functions take an
+optional `attachments` list (default `None`, backward compatible).
 
 Workflow payload: `strategy_summary`, `recommended_environments`,
 `effort_level` (Low/Medium/High), `steps[]` (each: `title`, `app` — one of the
@@ -63,17 +103,20 @@ only when non-empty (`step_meta_text`).
   lines; verified against Unicode, smart quotes, and `<`/`&`. Download buttons
   are guarded with `ModuleNotFoundError` fallbacks.
 - "Start new session" (`start_new_session`) clears `workflow` / `workflow_task` /
-  `workflow_notes` / `task_input` but keeps auth and the API key; "Sign out"
-  clears everything.
+  `workflow_notes` / `workflow_attachments` / `workflow_context_sig` /
+  `task_input` but keeps auth and the API key; "Sign out" clears everything.
 
 ## Result invalidation
 
 A generated workflow is cached in `st.session_state["workflow"]`, keyed by
-the task that produced it in `st.session_state["workflow_task"]`. On every
-rerun, if the (stripped) task input no longer matches `workflow_task`, the
-stale workflow is deleted from session state (along with `workflow_notes`)
-so it is never shown next to a different task — the user re-runs the button
-to regenerate. The comparison is whitespace-tolerant (`.strip()`).
+the task that produced it in `st.session_state["workflow_task"]` plus the
+attachment signature (`name:size` list) in
+`st.session_state["workflow_context_sig"]`. On every rerun, if the
+(stripped) task input or the attachment set no longer matches, the stale
+workflow is deleted from session state (along with `workflow_notes` /
+`workflow_attachments` / `workflow_context_sig`) so it is never shown next
+to different inputs — the user re-runs the button to regenerate. The task
+comparison is whitespace-tolerant (`.strip()`).
 
 ## Hard PRD constraints — do not violate
 
@@ -117,16 +160,21 @@ calls the target function (e.g. `render_workflow`) with fixture data.
 
 ## Conventions
 
-- Current model IDs only: `claude-haiku-4-5`, `claude-sonnet-5` (the PRD's
-  "Claude 3.5" names are retired). Model constants are at the top of
-  `app.py`.
+- Current model IDs only: `claude-haiku-4-5`, `claude-sonnet-5`,
+  `claude-opus-4-8` (the PRD's "Claude 3.5" names are retired). Model
+  constants are at the top of `app.py`. Every planner call clamps
+  `max_tokens` via `plan_budget(model)` / `MODEL_MAX_OUTPUT_TOKENS`
+  (Haiku 64K, Sonnet/Opus 128K — exceeding the cap is a 400), and gets its
+  thinking config from `thinking_kwargs(model)` (Opus 4.8 needs explicit
+  `{"type": "adaptive"}`).
 - Catch Anthropic SDK typed exceptions most-specific-first
   (`AuthenticationError` → `RateLimitError` → `APIStatusError` →
   `APIConnectionError`); never string-match error messages.
-- The generator and reviewer (`claude-sonnet-5`) run adaptive thinking by
-  default, so thinking tokens share `max_tokens` with the JSON plan. Both
+- The generators (Haiku/Opus 4.8) and reviewer (`claude-sonnet-5`) run with
+  thinking tokens sharing `max_tokens` with the JSON plan (Sonnet is
+  adaptive by default; Opus gets adaptive via `thinking_kwargs`). All these
   calls **stream** (`client.messages.stream(...).get_final_message()`) with
-  `PLAN_MAX_TOKENS` headroom — a non-streaming 8K budget truncated the plan
-  into invalid JSON, surfacing as "The planner returned an unexpected
+  `plan_budget(model)` headroom — a non-streaming 8K budget truncated the
+  plan into invalid JSON, surfacing as "The planner returned an unexpected
   response." Keep these calls streamed; only the router (Haiku, tiny output)
   uses non-streaming `create`.
